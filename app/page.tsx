@@ -177,7 +177,10 @@ function seedHistory(): TelemetryPoint[] {
 
 function useSimulation() {
   const [status, setStatus] = useState<TwinStatus>("stable");
-  const [data, setData] = useState<TelemetryPoint[]>(() => seedHistory());
+  // Start empty so the server-prerendered HTML (deterministic flat baseline)
+  // matches the first client render. Random seed is injected after mount only,
+  // otherwise SSR vs client random values cause a hydration mismatch (#418).
+  const [data, setData] = useState<TelemetryPoint[]>([]);
   const [agent, setAgent] = useState<AgentState>({ state: "idle", log: [] });
 
   const modeRef = useRef<TwinStatus>("stable");
@@ -188,6 +191,11 @@ function useSimulation() {
   useEffect(() => {
     modeRef.current = status;
   }, [status]);
+
+  // Seed the rolling history once, on the client, after hydration.
+  useEffect(() => {
+    setData(seedHistory());
+  }, []);
 
   // Live data feed — ticks regardless of mode so the platform always looks monitored.
   useEffect(() => {
