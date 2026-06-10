@@ -46,3 +46,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# ---- Local-only build/preview artifacts ----
+scripts/preview_*.png
+scripts/dev.log

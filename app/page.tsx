@@ -10,6 +10,7 @@ import {
   Cpu,
   Gauge,
   HardDrive,
+  Package,
   Play,
   Radio,
   RotateCcw,
@@ -33,25 +34,25 @@ type TelemetryPoint = {
   mse: number;
 };
 
-type BridgeTelemetry = {
-  status: TwinStatus;
-  mse: number;
-  actual_wave: number[];
-  predicted_wave: number[];
-};
-
 type AgentState = {
-  state: "idle" | "thinking" | "ready" | "error";
-  report?: string;
+  state: "idle" | "thinking" | "ready";
+  log: string[];
   vendor?: string;
   leadTimeDays?: number;
-  source?: string;
 };
 
-const pointCount = 200;
-const bridgeUrl = "ws://localhost:8000";
-const WARN_THRESHOLD = 2.5;
-const CRIT_THRESHOLD = 4.7;
+/* ---- Simulation tuning (mirrors firmware statistical baseline) ----
+   Baseline MSE distribution: mean mu = 0.15, sigma = 0.04.
+   warning threshold = mu + 3 sigma = 0.27
+   critical threshold = mu + 6 sigma = 0.39                              */
+const SIM_MEAN = 0.15;
+const SIM_SIGMA = 0.04;
+const WARN_THRESHOLD = SIM_MEAN + 3 * SIM_SIGMA; // 0.27
+const CRIT_THRESHOLD = SIM_MEAN + 6 * SIM_SIGMA; // 0.39
+
+const TICK_MS = 400; // simulated live feed cadence
+const HISTORY = 20; // last 20 calculation windows kept on the rolling chart
+const PHASE_STEP = 0.62; // carrier advance per tick
 
 type Theme = {
   accent: string;
@@ -97,7 +98,7 @@ const THEME: Record<TwinStatus, Theme> = {
   },
 };
 
-// Dead/frozen look when the bridge is disconnected.
+// Dead/frozen look (kept for completeness; the simulation runs always-live).
 const OFFLINE_THEME: Theme = {
   accent: "#52525b",
   rgb: "82,82,91",
@@ -116,120 +117,156 @@ const BANNER: Record<TwinStatus, string> = {
 };
 
 /* ============================================================
-   WebSocket telemetry + agent stream from the bridge
-   (the ONLY source of chart data — no synthetic/fallback generation)
+   Self-contained simulation engine
+   ------------------------------------------------------------
+   Replaces the live hardware WebSocket. A 400ms interval ticks a
+   state-driven MSE + waveform feed; judges drive it with buttons.
    ============================================================ */
 
-function isBridgeTelemetry(payload: unknown): payload is BridgeTelemetry {
-  if (!payload || typeof payload !== "object") {
-    return false;
-  }
-  const candidate = payload as Partial<BridgeTelemetry>;
-  return (
-    (candidate.status === "stable" || candidate.status === "warning" || candidate.status === "critical") &&
-    typeof candidate.mse === "number" &&
-    Array.isArray(candidate.predicted_wave)
-  );
+// Cheap approximate Gaussian (sum of 6 uniforms), ~N(0, 0.71).
+function gauss() {
+  let s = 0;
+  for (let i = 0; i < 6; i++) s += Math.random();
+  return s - 3;
 }
 
-function useWebSocketTelemetry(url: string) {
-  const [connected, setConnected] = useState(false);
+function clamp(v: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+// MSE for the current mode, honoring the mu/sigma threshold bands.
+function mseFor(mode: TwinStatus): number {
+  if (mode === "warning") {
+    // 3-sigma territory: 0.27 .. 0.38
+    return clamp(0.31 + gauss() * 0.03, WARN_THRESHOLD + 0.005, 0.382);
+  }
+  if (mode === "critical") {
+    // Past the 6-sigma latch: 0.40 .. ~0.75
+    return clamp(0.48 + Math.abs(gauss()) * 0.12, CRIT_THRESHOLD + 0.01, 0.78);
+  }
+  // Normal: fluctuates tightly below the warning threshold.
+  return clamp(SIM_MEAN + gauss() * SIM_SIGMA, 0.06, WARN_THRESHOLD - 0.012);
+}
+
+// One waveform sample (actual reality vs the clean 1.58-bit prediction).
+function sampleFor(mode: TwinStatus, phase: number): { actual: number; prediction: number } {
+  // The learned healthy model always predicts the same calm carrier.
+  const prediction = 0.42 * Math.sin(phase);
+
+  if (mode === "warning") {
+    return { actual: 0.55 * Math.sin(phase * 1.1) + gauss() * 0.17, prediction };
+  }
+  if (mode === "critical") {
+    // Motor seizing: violent amplitude + random structural spikes.
+    const spike = Math.random() < 0.32 ? (Math.random() < 0.5 ? -1 : 1) * (0.8 + Math.random() * 0.8) : 0;
+    return { actual: 1.25 * Math.sin(phase * 0.6) + gauss() * 0.5 + spike, prediction };
+  }
+  // Normal: actual tracks the prediction tightly.
+  return { actual: prediction + gauss() * 0.05, prediction };
+}
+
+function seedHistory(): TelemetryPoint[] {
+  const pts: TelemetryPoint[] = [];
+  for (let i = 0; i < HISTORY; i++) {
+    const phase = i * PHASE_STEP;
+    const { actual, prediction } = sampleFor("stable", phase);
+    pts.push({ index: i, actual, prediction, mse: mseFor("stable") });
+  }
+  return pts;
+}
+
+function useSimulation() {
   const [status, setStatus] = useState<TwinStatus>("stable");
-  const [data, setData] = useState<TelemetryPoint[]>([]);
-  const [agent, setAgent] = useState<AgentState>({ state: "idle" });
-  const socketRef = useRef<WebSocket | null>(null);
-  const indexRef = useRef(0);
+  const [data, setData] = useState<TelemetryPoint[]>(() => seedHistory());
+  const [agent, setAgent] = useState<AgentState>({ state: "idle", log: [] });
+
+  const modeRef = useRef<TwinStatus>("stable");
+  const phaseRef = useRef(HISTORY * PHASE_STEP);
+  const idxRef = useRef(HISTORY);
+  const timers = useRef<number[]>([]);
 
   useEffect(() => {
-    let reconnectTimer: number | undefined;
-    let closedByEffect = false;
+    modeRef.current = status;
+  }, [status]);
 
-    const connect = () => {
-      const socket = new WebSocket(url);
-      socketRef.current = socket;
-
-      socket.addEventListener("open", () => setConnected(true));
-
-      socket.addEventListener("message", (event) => {
-        let payload: unknown;
-        try {
-          payload = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-
-        // Agent orchestration messages from the bridge.
-        if (payload && typeof payload === "object" && "type" in payload) {
-          const msg = payload as { type: string; report?: string; vendor?: string; lead_time_days?: number; source?: string; error?: string };
-          if (msg.type === "agent_status") {
-            setAgent({ state: "thinking" });
-            return;
-          }
-          if (msg.type === "agent_report") {
-            setAgent({
-              state: msg.error ? "error" : "ready",
-              report: msg.error ? `Agent error: ${msg.error}` : msg.report,
-              vendor: msg.vendor,
-              leadTimeDays: msg.lead_time_days,
-              source: msg.source,
-            });
-            return;
-          }
-        }
-
-        if (!isBridgeTelemetry(payload)) {
-          return;
-        }
-
-        setStatus(payload.status);
-        if (payload.status === "stable") {
-          setAgent((prev) => (prev.state === "idle" ? prev : { state: "idle" }));
-        }
-
-        setData((previous) => {
-          const actual = Array.isArray(payload.actual_wave) ? payload.actual_wave : [];
-          const nextPoints = payload.predicted_wave.map((prediction, index) => ({
-            index: indexRef.current + index,
-            actual: Number(actual[index] ?? prediction),
-            prediction: Number(prediction),
-            mse: Number(payload.mse),
-          }));
-          indexRef.current += nextPoints.length;
-          return [...previous, ...nextPoints].slice(-pointCount);
-        });
-      });
-
-      socket.addEventListener("close", () => {
-        setConnected(false);
-        if (!closedByEffect) {
-          reconnectTimer = window.setTimeout(connect, 1200);
-        }
-      });
-
-      socket.addEventListener("error", () => socket.close());
-    };
-
-    connect();
-
-    return () => {
-      closedByEffect = true;
-      if (reconnectTimer) {
-        window.clearTimeout(reconnectTimer);
-      }
-      socketRef.current?.close();
-    };
-  }, [url]);
-
-  const sendCommand = useCallback((command: "stream_normal" | "inject_warning" | "inject_fault") => {
-    const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return false;
-    }
-    socket.send(JSON.stringify({ command }));
-    return true;
+  // Live data feed — ticks regardless of mode so the platform always looks monitored.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const mode = modeRef.current;
+      phaseRef.current += PHASE_STEP;
+      const { actual, prediction } = sampleFor(mode, phaseRef.current);
+      const point: TelemetryPoint = {
+        index: idxRef.current++,
+        actual,
+        prediction,
+        mse: mseFor(mode),
+      };
+      setData((prev) => [...prev, point].slice(-HISTORY));
+    }, TICK_MS);
+    return () => window.clearInterval(id);
   }, []);
 
-  return { connected, data, sendCommand, status, agent };
+  const clearChain = useCallback(() => {
+    timers.current.forEach((t) => window.clearTimeout(t));
+    timers.current = [];
+  }, []);
+
+  // Staggered Llama-3 procurement log on a critical trip.
+  const runAgent = useCallback(() => {
+    clearChain();
+    setAgent({ state: "thinking", log: [] });
+    const push = (line: string, delay: number) => {
+      const t = window.setTimeout(() => {
+        setAgent((prev) => ({ ...prev, log: [...prev.log, line] }));
+      }, delay);
+      timers.current.push(t);
+    };
+    push("[SYSTEM] 4ms Core Latch Triggered. Hardware rails killed on GPIO13.", 350);
+    push("[AGENT] Initializing Llama-3 procurement agent...", 1300);
+    push("[AGENT] Context matching complete: Plant 4 Spindle Motor component fault confirmed.", 2500);
+    const last = window.setTimeout(() => {
+      setAgent((prev) => ({
+        state: "ready",
+        log: [
+          ...prev.log,
+          "PURCHASE ORDER GENERATED: PO-2026-993A. Item: High-Load Spindle Ball Bearing (Qty: 1). Routed to SAP ERP queue.",
+        ],
+        vendor: "Konkan Precision · Mumbai",
+        leadTimeDays: 1,
+      }));
+    }, 3900);
+    timers.current.push(last);
+  }, [clearChain]);
+
+  const goNormal = useCallback(() => {
+    clearChain();
+    setAgent({ state: "idle", log: [] });
+    setStatus("stable");
+  }, [clearChain]);
+
+  const goWarning = useCallback(() => {
+    clearChain();
+    setAgent({ state: "idle", log: [] });
+    setStatus("warning");
+  }, [clearChain]);
+
+  const goCritical = useCallback(() => {
+    setStatus("critical");
+    runAgent();
+  }, [runAgent]);
+
+  const reset = useCallback(() => {
+    clearChain();
+    setAgent({ state: "idle", log: [] });
+    phaseRef.current = HISTORY * PHASE_STEP;
+    idxRef.current = HISTORY;
+    setData(seedHistory());
+    setStatus("stable");
+  }, [clearChain]);
+
+  useEffect(() => () => clearChain(), [clearChain]);
+
+  return { status, data, agent, goNormal, goWarning, goCritical, reset };
 }
 
 /* ============================================================
@@ -259,8 +296,6 @@ function formatUptime(total: number) {
    ============================================================ */
 
 function PhysicalDigitalTwin({ status, live }: { status: TwinStatus; live: boolean }) {
-  // When the bridge is disconnected the whole twin goes dead/frozen: no spin,
-  // no pulse, no flow, neutral gray. Status colors only apply when live.
   const critical = live && status === "critical";
   const warning = live && status === "warning";
   const theme = live ? THEME[status] : OFFLINE_THEME;
@@ -525,34 +560,17 @@ function PhysicalDigitalTwin({ status, live }: { status: TwinStatus; live: boole
 }
 
 /* ============================================================
-   Autonomous logistics agent terminal
+   Autonomous logistics agent terminal (mock staggered log)
    ============================================================ */
 
-function useTypewriter(text: string | undefined, active: boolean) {
-  const [typed, setTyped] = useState("");
-  useEffect(() => {
-    if (!active || !text) {
-      setTyped("");
-      return;
-    }
-    setTyped("");
-    let i = 0;
-    const id = window.setInterval(() => {
-      i += 2;
-      setTyped(text.slice(0, i));
-      if (i >= text.length) {
-        window.clearInterval(id);
-      }
-    }, 14);
-    return () => window.clearInterval(id);
-  }, [text, active]);
-  return typed;
+function agentLineClass(line: string): string {
+  if (line.startsWith("[SYSTEM]")) return "text-red-300";
+  if (line.startsWith("PURCHASE ORDER")) return "font-bold text-emerald-300";
+  return "text-emerald-100/90";
 }
 
 function AgentTerminal({ status, agent, live }: { status: TwinStatus; agent: AgentState; live: boolean }) {
   const open = live && status === "critical";
-  const ready = agent.state === "ready" || agent.state === "error";
-  const typed = useTypewriter(agent.report, open && ready);
 
   return (
     <AnimatePresence>
@@ -572,36 +590,47 @@ function AgentTerminal({ status, agent, live }: { status: TwinStatus; agent: Age
               </div>
               <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
                 <Bot size={13} />
-                {agent.source === "fallback" ? "rule-engine" : "llama-3 · rtx 3060"}
+                llama-3 · rtx 3060
               </span>
             </div>
 
-            <div className="min-h-[120px] max-h-[200px] overflow-y-auto pr-1 font-mono text-[13px] leading-relaxed text-emerald-100/90">
-              {agent.state === "thinking" || agent.state === "idle" ? (
-                <div className="flex items-center gap-3 text-zinc-400">
+            <div className="min-h-[120px] max-h-[200px] overflow-y-auto pr-1 font-mono text-[12.5px] leading-relaxed">
+              {agent.log.map((line, i) => (
+                <motion.p
+                  key={i}
+                  initial={{ opacity: 0, x: -6 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ duration: 0.18 }}
+                  className={`mb-1 flex gap-2 ${agentLineClass(line)}`}
+                >
+                  <span className="select-none text-red-400">$</span>
+                  <span className="flex items-start gap-1.5">
+                    {line.startsWith("PURCHASE ORDER") && <Package size={14} className="mt-0.5 shrink-0 text-emerald-300" />}
+                    <span>{line}</span>
+                  </span>
+                </motion.p>
+              ))}
+              {agent.state !== "ready" && (
+                <div className="mt-1 flex items-center gap-3 text-zinc-400">
                   <span className="bf-spinner h-4 w-4 rounded-full border-2 border-red-500/30 border-t-red-400" />
                   <span className="bf-blink">Llama-3 analyzing factory inventory &amp; approved suppliers…</span>
                 </div>
-              ) : (
-                <p className={agent.state === "error" ? "text-red-300" : ""}>
-                  <span className="text-red-400">$ </span>
-                  {typed}
-                  <span className="bf-caret">▋</span>
-                </p>
               )}
             </div>
 
-            {agent.state === "ready" && agent.vendor && (
+            {agent.state === "ready" && (
               <div className="mt-3 flex flex-wrap gap-2 border-t border-red-500/15 pt-3 text-[11px] font-semibold uppercase tracking-[0.12em]">
-                <span className="rounded-[5px] border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-1 text-emerald-200">
-                  Vendor: {agent.vendor}
-                </span>
+                {agent.vendor && (
+                  <span className="rounded-[5px] border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-1 text-emerald-200">
+                    Vendor: {agent.vendor}
+                  </span>
+                )}
                 {typeof agent.leadTimeDays === "number" && (
                   <span className="rounded-[5px] border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1 text-cyan-200">
                     ETA: {agent.leadTimeDays} day(s)
                   </span>
                 )}
-                <span className="rounded-[5px] border border-red-400/30 bg-red-500/10 px-2.5 py-1 text-red-200">PO auto-drafted</span>
+                <span className="rounded-[5px] border border-red-400/30 bg-red-500/10 px-2.5 py-1 text-red-200">PO auto-drafted → SAP ERP</span>
               </div>
             )}
           </div>
@@ -619,7 +648,7 @@ function StatusBanner({ status, live }: { status: TwinStatus; live: boolean }) {
   const critical = live && status === "critical";
   const theme = live ? THEME[status] : OFFLINE_THEME;
   const Icon = !live ? Radio : critical ? ShieldAlert : status === "warning" ? TriangleAlert : Radio;
-  const message = live ? BANNER[status] : "SYSTEM OFFLINE — Edge bridge disconnected (ws://localhost:8000)";
+  const message = live ? BANNER[status] : "SYSTEM OFFLINE — simulation halted";
   return (
     <div
       className={`rounded-[8px] border px-5 py-4 ${
@@ -640,8 +669,7 @@ function StatusBanner({ status, live }: { status: TwinStatus; live: boolean }) {
 }
 
 // Per-state visual envelope. `domain` = vertical zoom, `clamp` = hard amplitude
-// cap so spikes can't blow out the panel. Warning stays only slightly rougher
-// than stable; the big chaotic excursions are reserved for critical.
+// cap so spikes can't blow out the panel.
 const WAVE_ENVELOPE: Record<TwinStatus, { domain: number; clamp: number }> = {
   stable: { domain: 0.9, clamp: 0.78 },
   warning: { domain: 0.9, clamp: 0.86 },
@@ -652,9 +680,8 @@ function buildWavePath(data: TelemetryPoint[], key: "actual" | "prediction", sta
   const width = 720;
   const height = 236;
   const pad = 18;
-  const { domain, clamp } = WAVE_ENVELOPE[status];
+  const { domain, clamp: cap } = WAVE_ENVELOPE[status];
 
-  // No real telemetry yet (bridge offline) → render a flat, frozen baseline.
   if (data.length < 2) {
     const mid = (height / 2).toFixed(2);
     return `M ${pad} ${mid} L ${width - pad} ${mid}`;
@@ -663,7 +690,7 @@ function buildWavePath(data: TelemetryPoint[], key: "actual" | "prediction", sta
   return data
     .map((point, index) => {
       const x = pad + (index / Math.max(1, data.length - 1)) * (width - pad * 2);
-      const clipped = Math.max(-clamp, Math.min(clamp, point[key]));
+      const clipped = Math.max(-cap, Math.min(cap, point[key]));
       const y = pad + ((domain - clipped) / (domain * 2)) * (height - pad * 2);
       return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
     })
@@ -733,7 +760,7 @@ function TelemetryMonitor({ data, status, uptime, live }: { data: TelemetryPoint
       </div>
       <div className="mt-4 grid grid-cols-3 gap-3">
         <Readout icon={<Waves size={18} />} label="Vibration" value={live ? `${vibration} mm/s` : "—"} theme={theme} />
-        <Readout icon={<Gauge size={18} />} label="Live MSE" value={live ? mse.toFixed(2) : "—"} theme={theme} />
+        <Readout icon={<Gauge size={18} />} label="Live MSE" value={live ? mse.toFixed(3) : "—"} theme={theme} />
         <Readout icon={<Clock size={18} />} label="Uptime" value={live ? formatUptime(uptime) : "—"} theme={theme} />
       </div>
     </div>
@@ -741,92 +768,107 @@ function TelemetryMonitor({ data, status, uptime, live }: { data: TelemetryPoint
 }
 
 /* ============================================================
-   Command console
+   Judge Sandbox control panel
    ============================================================ */
 
-function Controls({
+function JudgeSandbox({
   status,
-  connected,
   onNormal,
   onWarning,
   onFault,
+  onReset,
 }: {
   status: TwinStatus;
-  connected: boolean;
   onNormal: () => void;
   onWarning: () => void;
   onFault: () => void;
+  onReset: () => void;
 }) {
   return (
-    <div className="grid grid-cols-3 gap-3">
-      <button
-        type="button"
-        onClick={onNormal}
-        className={`button-3d flex h-14 items-center justify-center gap-2 rounded-[8px] border px-3 text-xs font-black uppercase tracking-[0.1em] transition hover:-translate-y-0.5 active:translate-y-0 ${
-          status === "stable" ? "border-emerald-400/50 bg-emerald-400/12 text-emerald-100" : "border-zinc-400/30 bg-white/[.05] text-zinc-100"
-        }`}
-      >
-        <Play size={16} />
-        Normal
-      </button>
-      <button
-        type="button"
-        onClick={onWarning}
-        className={`button-3d flex h-14 items-center justify-center gap-2 rounded-[8px] border px-3 text-xs font-black uppercase tracking-[0.1em] transition hover:-translate-y-0.5 active:translate-y-0 ${
-          status === "warning" ? "border-amber-400/70 bg-amber-400/16 text-amber-50" : "border-amber-400/35 bg-amber-400/8 text-amber-100"
-        }`}
-      >
-        <TriangleAlert size={16} />
-        Warning
-      </button>
-      <button
-        type="button"
-        onClick={onFault}
-        className={`button-3d flex h-14 items-center justify-center gap-2 rounded-[8px] border px-3 text-xs font-black uppercase tracking-[0.1em] transition hover:-translate-y-0.5 active:translate-y-0 ${
-          status === "critical" ? "critical-flash border-red-400/85 bg-red-500/22 text-red-50" : "border-red-400/40 bg-red-500/10 text-red-100 hover:bg-red-500/18"
-        }`}
-      >
-        <AlertTriangle size={16} />
-        Inject Fault
-      </button>
-      <div className="col-span-3 flex items-center justify-end gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-        <span className={`h-2 w-2 rounded-full ${connected ? "bg-emerald-300 shadow-[0_0_16px_rgba(34,197,94,.5)]" : "bg-zinc-700"}`} />
-        {connected ? "Bridge linked: ws://localhost:8000" : "Bridge offline — chart frozen (awaiting ws://localhost:8000)"}
+    <div className="depth-panel rounded-[8px] border border-zinc-700/50 p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="h-2 w-2 rounded-full bg-cyan-300 shadow-[0_0_14px_rgba(34,211,238,.7)]" />
+          <p className="text-xs font-black uppercase tracking-[0.2em] text-cyan-200">Judge Sandbox</p>
+        </div>
+        <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">Self-contained · no hardware</span>
       </div>
+
+      <div className="grid grid-cols-3 gap-3">
+        <button
+          type="button"
+          onClick={onNormal}
+          className={`button-3d flex h-14 items-center justify-center gap-2 rounded-[8px] border px-3 text-xs font-black uppercase tracking-[0.08em] transition hover:-translate-y-0.5 active:translate-y-0 ${
+            status === "stable" ? "border-emerald-400/50 bg-emerald-400/12 text-emerald-100" : "border-zinc-400/30 bg-white/[.05] text-zinc-100"
+          }`}
+        >
+          <Play size={16} />
+          Normal Mode
+        </button>
+        <button
+          type="button"
+          onClick={onWarning}
+          className={`button-3d flex h-14 items-center justify-center gap-2 rounded-[8px] border px-3 text-xs font-black uppercase tracking-[0.08em] transition hover:-translate-y-0.5 active:translate-y-0 ${
+            status === "warning" ? "border-amber-400/70 bg-amber-400/16 text-amber-50" : "border-amber-400/35 bg-amber-400/8 text-amber-100"
+          }`}
+        >
+          <TriangleAlert size={16} />
+          Trigger Warning
+        </button>
+        <button
+          type="button"
+          onClick={onFault}
+          className={`button-3d flex h-14 items-center justify-center gap-2 rounded-[8px] border px-3 text-xs font-black uppercase tracking-[0.08em] transition hover:-translate-y-0.5 active:translate-y-0 ${
+            status === "critical" ? "critical-flash border-red-400/85 bg-red-500/22 text-red-50" : "border-red-400/40 bg-red-500/10 text-red-100 hover:bg-red-500/18"
+          }`}
+        >
+          <AlertTriangle size={16} />
+          Inject Critical Fault
+        </button>
+      </div>
+
+      <button
+        type="button"
+        onClick={onReset}
+        className="button-3d mt-3 flex h-11 w-full items-center justify-center gap-2 rounded-[8px] border border-zinc-500/40 bg-white/[.04] px-3 text-xs font-black uppercase tracking-[0.12em] text-zinc-200 transition hover:-translate-y-0.5 hover:bg-white/[.08] active:translate-y-0"
+      >
+        <RotateCcw size={15} />
+        Reset Simulation
+      </button>
     </div>
   );
 }
 
 function OperationsConsole({
   status,
-  connected,
   data,
   agent,
   uptime,
   onNormal,
   onWarning,
   onFault,
+  onReset,
 }: {
   status: TwinStatus;
-  connected: boolean;
   data: TelemetryPoint[];
   agent: AgentState;
   uptime: number;
   onNormal: () => void;
   onWarning: () => void;
   onFault: () => void;
+  onReset: () => void;
 }) {
   return (
     <section className="flex h-full min-h-[620px] flex-col gap-4 overflow-y-auto pr-1">
-      <StatusBanner status={status} live={connected} />
-      <TelemetryMonitor data={data} status={status} uptime={uptime} live={connected} />
-      <AgentTerminal status={status} agent={agent} live={connected} />
+      <StatusBanner status={status} live />
+      <TelemetryMonitor data={data} status={status} uptime={uptime} live />
+      <AgentTerminal status={status} agent={agent} live />
       <div className="grid flex-none grid-cols-2 gap-4">
         <MetricCard icon={<Cpu size={20} />} label="Parameters" value="864K (1.58-bit)" />
         <MetricCard icon={<HardDrive size={20} />} label="SRAM Footprint" value="215 KB" />
       </div>
       <div className="flex-none">
-        <Controls status={status} connected={connected} onNormal={onNormal} onWarning={onWarning} onFault={onFault} />
+        <JudgeSandbox status={status} onNormal={onNormal} onWarning={onWarning} onFault={onFault} onReset={onReset} />
       </div>
     </section>
   );
@@ -849,23 +891,16 @@ function MetricCard({ icon, label, value }: { icon: React.ReactNode; label: stri
    ============================================================ */
 
 export default function Home() {
-  // The bridge WebSocket is the single source of truth. No synthetic data:
-  // if it is disconnected, `data` stays empty and the chart renders frozen flat.
-  const bridge = useWebSocketTelemetry(bridgeUrl);
+  const sim = useSimulation();
   const uptime = useUptime();
 
-  const live = bridge.connected;
-  const data = bridge.data;
-  const status: TwinStatus = bridge.status;
-  const agent = bridge.agent;
-  const critical = live && status === "critical";
+  const live = true; // self-contained simulation is always "live"
+  const status: TwinStatus = sim.status;
+  const data = sim.data;
+  const agent = sim.agent;
+  const critical = status === "critical";
 
-  // Buttons only forward commands to the bridge; they generate no local data.
-  const streamNormal = () => bridge.sendCommand("stream_normal");
-  const injectWarning = () => bridge.sendCommand("inject_warning");
-  const injectFault = () => bridge.sendCommand("inject_fault");
-
-  const theme = live ? THEME[status] : OFFLINE_THEME;
+  const theme = THEME[status];
 
   return (
     <main className="relative h-screen overflow-hidden bg-[#030303] p-5 text-slate-50">
@@ -877,7 +912,7 @@ export default function Home() {
         <div className="flex items-center gap-3">
           <div
             className={`rounded-[8px] border p-2.5 ${
-              !live ? `${theme.border} ${theme.bg} ${theme.text}` : critical ? "critical-flash border-red-400/70 bg-red-500/12 text-red-100" : `stable-pulse ${theme.border} ${theme.bg} ${theme.text}`
+              critical ? "critical-flash border-red-400/70 bg-red-500/12 text-red-100" : `stable-pulse ${theme.border} ${theme.bg} ${theme.text}`
             }`}
           >
             <Zap size={22} />
@@ -889,7 +924,7 @@ export default function Home() {
         </div>
         <div
           className={`hidden rounded-[8px] border px-4 py-2 text-sm font-black uppercase tracking-[0.13em] md:block ${
-            !live ? `${theme.border} ${theme.bg} ${theme.text}` : critical ? "critical-flash border-red-400/80 bg-red-500/16 text-red-50" : `stable-pulse ${theme.border} ${theme.bg} ${theme.text}`
+            critical ? "critical-flash border-red-400/80 bg-red-500/16 text-red-50" : `stable-pulse ${theme.border} ${theme.bg} ${theme.text}`
           }`}
         >
           {theme.label}
@@ -900,19 +935,19 @@ export default function Home() {
         <PhysicalDigitalTwin status={status} live={live} />
         <OperationsConsole
           status={status}
-          connected={bridge.connected}
           data={data}
           agent={agent}
           uptime={uptime}
-          onNormal={streamNormal}
-          onWarning={injectWarning}
-          onFault={injectFault}
+          onNormal={sim.goNormal}
+          onWarning={sim.goWarning}
+          onFault={sim.goCritical}
+          onReset={sim.reset}
         />
       </div>
 
       <div className="pointer-events-none absolute bottom-4 left-6 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.2em] text-slate-600">
-        <RotateCcw size={14} />
-        {bridge.connected ? "Edge bridge online" : "Edge bridge offline"}
+        <Radio size={14} />
+        Judge Sandbox · self-contained simulation
       </div>
     </main>
   );
