@@ -1,0 +1,49 @@
+================================================================
+NEURAL-SHIELD — ET AutoTech Hackathon 2026 (Prototype Submission)
+================================================================
+
+Theme   : Theme 1 — AI for Resilient Automotive Supply Chains & Smart Manufacturing
+Team    : Aryan Gupta
+Members : Aryan Gupta
+
+----------------------------------------------------------------
+DELIVERABLES
+----------------------------------------------------------------
+
+1. Working interactive prototype (live dashboard)
+   https://neural-shield-henna.vercel.app/
+
+2. Source code / GitHub repository (all files required to run)
+   https://github.com/aryxnsdfs/NEURAL-SHIELD-
+
+3. Demonstration video
+   https://youtu.be/ubZhl3gy0lw?si=qgb4qMScev48XenK
+   (a copy is also included in this submission zip)
+
+4. Presentation
+   NEURAL-SHIELD_Presentation.pptx (included in this zip)
+
+----------------------------------------------------------------
+WHAT IT IS
+----------------------------------------------------------------
+
+NEURAL-SHIELD is a self-contained neural network running on a $5
+ESP32 microcontroller. It learns a machine's healthy vibration
+signature on-device, physically cuts power within ~4 ms when a
+catastrophic fault is detected, and triggers an autonomous Llama-3
+agent that drafts the replacement purchase order — no cloud, no
+internet round-trip, no latency.
+
+The live dashboard above is a self-contained simulation (no hardware
+required): use the Judge Sandbox panel to drive Normal / Warning /
+Critical states and watch the digital twin, live MSE waveform, and
+the AI procurement agent respond in real time.
+
+----------------------------------------------------------------
+RUNNING THE FULL SYSTEM (optional, see GitHub README)
+----------------------------------------------------------------
+
+  Dashboard : npm install && npm run dev      (http://localhost:3000)
+  Bridge    : pip install -r backend/requirements.txt && python backend/bridge.py
+  Agent     : ollama pull llama3 && ollama serve
+  Firmware  : flash firmware/main/main.ino to an ESP32 (Arduino IDE)
