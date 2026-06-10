@@ -1,0 +1,68 @@
+{
+  "facility": {
+    "company": "Bit-Forge Industrial",
+    "plant": "Pune Assembly Plant",
+    "location": "Pune, Maharashtra, India",
+    "assembly_line": "Line 3",
+    "asset": "Line 3 Spindle CNC Assembly",
+    "asset_id": "SPN-L3-04",
+    "shift_supervisor": "R. Deshmukh",
+    "downtime_cost_per_hour_usd": 4200
+  },
+  "inventory": [
+    {
+      "part": "High-Speed Angular Contact Bearing",
+      "sku": "BRG-7008-ACD",
+      "spindle_compatible": true,
+      "on_hand": 0,
+      "reorder_point": 4,
+      "location": "Warehouse A / Rack 12"
+    },
+    {
+      "part": "Spindle Drive Belt",
+      "sku": "BLT-DRV-220",
+      "spindle_compatible": false,
+      "on_hand": 6,
+      "reorder_point": 2,
+      "location": "Warehouse A / Rack 04"
+    },
+    {
+      "part": "Coolant Seal Kit",
+      "sku": "SEL-CLT-09",
+      "spindle_compatible": false,
+      "on_hand": 11,
+      "reorder_point": 3,
+      "location": "Warehouse B / Rack 02"
+    }
+  ],
+  "approved_suppliers": [
+    {
+      "id": "SUP-MUM-01",
+      "name": "Konkan Precision Bearings",
+      "location": "Mumbai, India",
+      "ships_part": "BRG-7008-ACD",
+      "lead_time_days": 1,
+      "shipping": "Same-day dispatch, next-day road freight",
+      "unit_price_usd": 86.0,
+      "min_order_qty": 4,
+      "customs": "Domestic, no customs",
+      "reliability_rating": 0.97
+    },
+    {
+      "id": "SUP-CHN-02",
+      "name": "Shenzhen MotionTech Co.",
+      "location": "Shenzhen, China",
+      "ships_part": "BRG-7008-ACD",
+      "lead_time_days": 5,
+      "shipping": "Air freight + customs clearance",
+      "unit_price_usd": 41.0,
+      "min_order_qty": 10,
+      "customs": "Import duty + 2-3 day customs hold",
+      "reliability_rating": 0.9
+    }
+  ],
+  "policy": {
+    "priority": "minimize_line_downtime",
+    "notes": "Line 3 has zero spindle bearings on hand. Any spindle bearing fault halts production immediately. Prefer the fastest reliable source even at higher unit cost when downtime cost exceeds part cost delta."
+  }
+}

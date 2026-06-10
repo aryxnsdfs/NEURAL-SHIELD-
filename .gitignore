@@ -1,0 +1,48 @@
+# ============================================================
+#  NEURAL-SHIELD .gitignore
+# ============================================================
+
+# ---- Node / Next.js (dashboard) ----
+node_modules/
+.next/
+out/
+build/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
+# ---- Python (bridge + training) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+
+# ---- Environment / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Large model checkpoints (reproducible via training/train_predictor.py) ----
+*.pt
+*.pth
+*.onnx
+
+# ---- Raw vibration datasets (download from CWRU Bearing Data Center) ----
+data/cwru_normal/*.mat
+
+# ---- Arduino / firmware build output ----
+firmware/**/build/
+*.bin
+*.elf
+*.hex
+
+# ---- OS / editor junk ----
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+*.swp
